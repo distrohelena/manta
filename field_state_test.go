@@ -63,3 +63,77 @@ func TestCloneIsolatesMutableLeaves(t *testing.T) {
 	v[0] = 10
 	assert.Equal([]float32{10, 9}, a.get(at(0)))
 }
+
+// TestSetLengthTruncates verifies that writing a variable array or table
+// length onto an existing nested state drops the elements at or past the new
+// length (the client resizes the vector), keeps the ones before it, records
+// the length, and never touches a baseline template it is shared with.
+func TestSetLengthTruncates(t *testing.T) {
+	assert := assert.New(t)
+
+	at := func(path ...int32) *fieldPath {
+		fp := &fieldPath{}
+		copy(fp.path[:], path)
+		fp.last = int32(len(path) - 1)
+		return fp
+	}
+
+	// setLength writes a length as readFields does.
+	setLength := func(s *fieldState, fp *fieldPath, n uint32) {
+		if s.set(fp, smallUint64Cell(uint64(n))) {
+			s.resizeAt(fp, n)
+		}
+	}
+
+	tmpl := newFieldState()
+	// Variable array at 0: length leaf first, then three elements.
+	setLength(tmpl, at(0), 3)
+	tmpl.set(at(0, 0), int32Cell(10))
+	tmpl.set(at(0, 1), int32Cell(11))
+	tmpl.set(at(0, 2), int32Cell(12))
+	// Variable table at 1: two element tables with one field each.
+	setLength(tmpl, at(1), 2)
+	tmpl.set(at(1, 0, 0), int32Cell(20))
+	tmpl.set(at(1, 1, 0), int32Cell(21))
+	tmpl.share()
+
+	n, ok := tmpl.lengthAt(at(0))
+	assert.True(ok)
+	assert.Equal(uint32(3), n, "length kept when the leaf becomes a nested state")
+
+	a := tmpl.clone()
+	setLength(a, at(0), 1)
+	setLength(a, at(1), 1)
+
+	assert.Equal(int32(10), a.get(at(0, 0)))
+	assert.Nil(a.get(at(0, 1)))
+	assert.Nil(a.get(at(0, 2)))
+	assert.Equal(int32(20), a.get(at(1, 0, 0)))
+	assert.Nil(a.get(at(1, 1, 0)))
+	n, ok = a.lengthAt(at(0))
+	assert.True(ok)
+	assert.Equal(uint32(1), n)
+	n, ok = a.lengthAt(at(1))
+	assert.True(ok)
+	assert.Equal(uint32(1), n)
+
+	// The template is untouched.
+	assert.Equal(int32(12), tmpl.get(at(0, 2)))
+	assert.Equal(int32(21), tmpl.get(at(1, 1, 0)))
+	n, _ = tmpl.lengthAt(at(0))
+	assert.Equal(uint32(3), n)
+
+	// Growing again keeps the surviving element; new ones appear when set.
+	setLength(a, at(0), 4)
+	assert.Equal(int32(10), a.get(at(0, 0)))
+	assert.Nil(a.get(at(0, 1)))
+	a.set(at(0, 3), int32Cell(13))
+	assert.Equal(int32(13), a.get(at(0, 3)))
+	n, _ = a.lengthAt(at(0))
+	assert.Equal(uint32(4), n)
+
+	// A plain field has no length.
+	a.set(at(2), int32Cell(5))
+	_, ok = a.lengthAt(at(2))
+	assert.False(ok)
+}

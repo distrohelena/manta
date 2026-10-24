@@ -6,6 +6,7 @@ import (
 	"reflect"
 	"sort"
 	"strconv"
+	"strings"
 	"testing"
 )
 
@@ -50,8 +51,14 @@ func TestChangedMapReplaysMap(t *testing.T) {
 		every = n
 	}
 
+	// MANTA_CHANGED_FAST=1 compares with an equivalent of Map that caches
+	// field path names and builds no map (same paths, names and values), so
+	// a check of every update of a whole replay fits in a few minutes.
+	fast := os.Getenv("MANTA_CHANGED_FAST") == "1"
+	names := fpNames{}
+
 	shadow := map[*Entity]map[string]interface{}{}
-	var updates, changedFields, checked int
+	var updates, changedFields, checked, removed int
 	p.OnEntity(func(e *Entity, op EntityOp) error {
 		switch {
 		case op.Flag(EntityOpCreated):
@@ -72,6 +79,11 @@ func TestChangedMapReplaysMap(t *testing.T) {
 				t.Fatalf("tick %d: update of unknown %s", p.Tick, e)
 			}
 			updates++
+			// Shrunk arrays and tables drop their trailing elements
+			// (heldota fork): remove them from the shadow first.
+			for name, n := range e.ChangedLengths() {
+				removed += dropElements(s, name, n)
+			}
 			for k, v := range e.ChangedMap() {
 				s[k] = v
 				changedFields++
@@ -79,7 +91,11 @@ func TestChangedMapReplaysMap(t *testing.T) {
 			if updates%every != 0 {
 				return nil
 			}
-			if m := e.Map(); len(mapDiff(s, m)) != 0 {
+			if fast {
+				if !names.matches(e, s) {
+					t.Fatalf("tick %d: %s: state from ChangedMap differs from Map: %v", p.Tick, e, mapDiff(s, e.Map()))
+				}
+			} else if m := e.Map(); len(mapDiff(s, m)) != 0 {
 				t.Fatalf("tick %d: %s: state from ChangedMap differs from Map: %v", p.Tick, e, mapDiff(s, m))
 			}
 			checked++
@@ -92,14 +108,76 @@ func TestChangedMapReplaysMap(t *testing.T) {
 	if checked == 0 {
 		t.Fatal("no updates checked")
 	}
-	t.Logf("%d updates checked, %d changed fields", checked, changedFields)
+	t.Logf("%d updates checked, %d changed fields, %d elements removed by shrinks", checked, changedFields, removed)
 
 	// Outside a handler the change set is released.
 	for _, e := range p.entities {
 		if e != nil && len(e.ChangedMap()) != 0 {
 			t.Fatalf("%s: ChangedMap not empty outside a handler", e)
 		}
+		if e != nil && len(e.ChangedLengths()) != 0 {
+			t.Fatalf("%s: ChangedLengths not empty outside a handler", e)
+		}
 	}
+}
+
+type fpKey struct {
+	c  *class
+	fp fieldPath
+}
+
+// fpNames caches class field path names for the fast comparison.
+type fpNames map[fpKey]string
+
+// seenNames is scratch for fpNames.matches (Map keeps one entry per name).
+var seenNames = map[string]struct{}{}
+
+// matches reports whether shadow equals e.Map(): every path Map lists has
+// the same name and value in shadow, and shadow has no other key.
+func (n fpNames) matches(e *Entity, shadow map[string]interface{}) bool {
+	root := newFieldPath()
+	fps := e.class.getFieldPaths(root, e.state)
+	root.release()
+	clear(seenNames)
+	ok := true
+	for _, fp := range fps {
+		k := fpKey{e.class, *fp}
+		name, hit := n[k]
+		if !hit {
+			name = e.class.getNameForFieldPath(fp)
+			n[k] = name
+		}
+		if ok {
+			if v, present := shadow[name]; !present || !sameValue(v, e.state.get(fp)) {
+				ok = false
+			}
+		}
+		seenNames[name] = struct{}{}
+		fp.release()
+	}
+	return ok && len(seenNames) == len(shadow)
+}
+
+// dropElements deletes from s the elements of the array or table name at
+// index n or above ("name.NNNN" and "name.NNNN.*") and returns how many.
+func dropElements(s map[string]interface{}, name string, n uint32) int {
+	removed := 0
+	prefix := name + "."
+	for k := range s {
+		rest, ok := strings.CutPrefix(k, prefix)
+		if !ok || len(rest) < 4 {
+			continue
+		}
+		i, err := strconv.Atoi(rest[:4])
+		if err != nil || len(rest) > 4 && rest[4] != '.' {
+			continue
+		}
+		if uint32(i) >= n {
+			delete(s, k)
+			removed++
+		}
+	}
+	return removed
 }
 
 // mapDiff describes up to 5 keys whose values differ between got and want.

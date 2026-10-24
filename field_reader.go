@@ -23,7 +23,11 @@ func readFields(r *reader, s *serializer, state *fieldState, fpBuf []fieldPath) 
 		}
 
 		val := decoder(r)
-		state.set(fp, val)
+		if state.set(fp, val) && val.kind == cellUint64 && s.isLengthPath(fp, 0) {
+			// A variable array or table length over existing elements
+			// (heldota fork): drop the elements past it.
+			state.resizeAt(fp, val.num)
+		}
 
 		if dbg {
 			name := strings.Join(s.getNameForFieldPath(fp, 0), ".")

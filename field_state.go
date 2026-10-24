@@ -194,7 +194,10 @@ func (s *fieldState) getCell(fp *fieldPath) cell {
 	return cell{}
 }
 
-func (s *fieldState) set(fp *fieldPath, c cell) {
+// set stores c at fp, creating nested states along the way. It reports
+// whether fp ended at an existing nested state, in which case c was not
+// stored (see resizeAt).
+func (s *fieldState) set(fp *fieldPath, c cell) (container bool) {
 	x := s
 	for i := int32(0); i <= fp.last; i++ {
 		z := int(fp.path[i])
@@ -204,22 +207,91 @@ func (s *fieldState) set(fp *fieldPath, c cell) {
 			x.state = grown
 		}
 		if i == fp.last {
-			// Do not overwrite an existing sub-table with a leaf value.
+			// Do not overwrite an existing sub-table with a leaf value. Such
+			// a write is the length of a variable array or table (or the
+			// presence bit of a fixed table): the caller applies lengths
+			// with resizeAt (heldota fork).
 			if x.state[z].kind != cellSub {
 				x.state[z] = c
+				return false
 			}
-			return
+			return true
 		}
 		if x.state[z].kind != cellSub {
+			// A length written before the first element is kept in the new
+			// nested state's cell (see lengthAt).
+			n := uint32(0)
+			if x.state[z].kind == cellUint64 {
+				n = x.state[z].num
+			}
 			x.state[z] = subCell(newFieldState())
+			x.state[z].num = n
 		} else if x.state[z].shared {
-			// First write into a nested state shared with the baseline
-			// template: copy it for this entity (copy on write). Its own
-			// nested states and leaves stay shared until written.
-			x.state[z] = subCell(&fieldState{state: slices.Clone((*fieldState)(x.state[z].ptr).state)})
+			x.unshare(z)
 		}
 		x, _ = x.state[z].sub()
 	}
+	return false
+}
+
+// resizeAt applies n, the new length of the variable array or table at fp
+// whose elements already live in a nested state (set reported a container
+// write): see resize.
+func (s *fieldState) resizeAt(fp *fieldPath, n uint32) {
+	x := s
+	for i := int32(0); i < fp.last; i++ {
+		z := int(fp.path[i])
+		if x.state[z].shared {
+			x.unshare(z)
+		}
+		x, _ = x.state[z].sub()
+	}
+	x.resize(int(fp.path[fp.last]), n)
+}
+
+// unshare replaces the nested state at z, shared with a baseline template, by
+// a copy owned by this entity (copy on write on its first write). Its own
+// nested states and leaves stay shared until written; the cell keeps its
+// length.
+func (s *fieldState) unshare(z int) {
+	n := s.state[z].num
+	s.state[z] = subCell(&fieldState{state: slices.Clone((*fieldState)(s.state[z].ptr).state)})
+	s.state[z].num = n
+}
+
+// resize records n as the length of the variable array or table whose
+// elements are in the nested state at z, and empties the elements at index n
+// and above (heldota fork). Without this, elements of a shrunk vector stayed
+// in the state, and in Entity.Map, forever.
+func (s *fieldState) resize(z int, n uint32) {
+	sub := (*fieldState)(s.state[z].ptr)
+	stale := false
+	for i := int(n); i < len(sub.state); i++ {
+		if !sub.state[i].isEmpty() {
+			stale = true
+			break
+		}
+	}
+	if stale {
+		if s.state[z].shared {
+			s.unshare(z)
+			sub = (*fieldState)(s.state[z].ptr)
+		}
+		clear(sub.state[n:])
+	}
+	s.state[z].num = n
+}
+
+// lengthAt returns the length last written at fp, the path of a variable
+// array or table: the length leaf before any element exists, or the length
+// kept in the nested state's cell afterwards. ok is false when fp holds no
+// such value.
+func (s *fieldState) lengthAt(fp *fieldPath) (n uint32, ok bool) {
+	switch c := s.getCell(fp); c.kind {
+	case cellUint64, cellSub:
+		return c.num, true
+	}
+	return 0, false
 }
 
 // share makes s a class baseline template for clone: every vector and blob

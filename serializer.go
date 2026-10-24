@@ -74,3 +74,13 @@ func (s *serializer) isLeafPath(fp *fieldPath, pos int32) bool {
 	}
 	return s.fields[i].isLeafPath(fp, pos+1)
 }
+
+// isLengthPath reports whether fp, from component pos on, ends at the length
+// of a variable array or table (see field.isLengthPath).
+func (s *serializer) isLengthPath(fp *fieldPath, pos int32) bool {
+	i := fp.path[pos]
+	if i < 0 || int(i) >= len(s.fields) {
+		return false
+	}
+	return s.fields[i].isLengthPath(fp, pos+1)
+}

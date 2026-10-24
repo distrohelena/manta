@@ -337,3 +337,17 @@ func (f *field) isLeafPath(fp *fieldPath, pos int32) bool {
 	}
 	return fp.last == pos-1
 }
+
+// isLengthPath reports whether fp, whose component pos-1 selected f, ends at
+// the length of a variable array or table (f itself or a nested one).
+func (f *field) isLengthPath(fp *fieldPath, pos int32) bool {
+	switch f.model {
+	case fieldModelVariableArray:
+		return fp.last == pos-1
+	case fieldModelVariableTable:
+		return fp.last == pos-1 || fp.last >= pos+1 && f.serializer.isLengthPath(fp, pos+1)
+	case fieldModelFixedTable:
+		return fp.last >= pos && f.serializer.isLengthPath(fp, pos)
+	}
+	return false
+}

@@ -429,3 +429,28 @@ func (e *Entity) ChangedMap() map[string]interface{} {
 	}
 	return values
 }
+
+// ChangedLengths returns, for the update currently being dispatched to an
+// EntityHandler, the name and new length of every variable array or table
+// whose length was decoded in it (heldota fork). A length drops the elements
+// at or past it from the state, and so from Map: a consumer that tracks
+// deltas with ChangedMap removes its copies of those elements (names
+// "<name>.NNNN" and, for tables, "<name>.NNNN.<field>" with NNNN >= length).
+// Apply these before the ChangedMap values: elements re-sent after a shrink
+// are in ChangedMap. Empty in the same cases as ChangedMap.
+func (e *Entity) ChangedLengths() map[string]uint32 {
+	lengths := map[string]uint32{}
+	if e.changes == nil {
+		return lengths
+	}
+	for i := range e.changes.fps {
+		fp := &e.changes.fps[i]
+		if !e.class.serializer.isLengthPath(fp, 0) {
+			continue
+		}
+		if n, ok := e.state.lengthAt(fp); ok {
+			lengths[e.class.getNameForFieldPath(fp)] = n
+		}
+	}
+	return lengths
+}
