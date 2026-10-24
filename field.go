@@ -266,9 +266,9 @@ func (f *field) getFieldPaths(fp *fieldPath, state *fieldState) []*fieldPath {
 		}
 
 	case fieldModelFixedTable:
-		if sub, ok := state.get(fp).(*fieldState); ok {
+		if _, ok := state.get(fp).(*fieldState); ok {
 			fp.last++
-			x = append(x, f.serializer.getFieldPaths(fp, sub)...)
+			x = append(x, f.serializer.getFieldPaths(fp, state)...)
 			fp.last--
 		}
 
@@ -288,9 +288,9 @@ func (f *field) getFieldPaths(fp *fieldPath, state *fieldState) []*fieldPath {
 		if sub, ok := state.get(fp).(*fieldState); ok {
 			fp.last += 2
 			for i, v := range sub.state {
-				if vv, ok := v.sub(); ok {
+				if _, ok := v.sub(); ok {
 					fp.path[fp.last-1] = int32(i)
-					x = append(x, f.serializer.getFieldPaths(fp, vv)...)
+					x = append(x, f.serializer.getFieldPaths(fp, state)...)
 				}
 			}
 			fp.last -= 2
@@ -321,4 +321,19 @@ func assertLenMin(s string, n int) {
 	if len(s) < n {
 		_panicf("assertion failed: '%s' is less than %d long", s, n)
 	}
+}
+
+// isLeafPath reports whether fp, whose component pos-1 selected f, ends at a
+// value that getFieldPaths lists (an element or simple field), as opposed to
+// a container (the length of an array, or a table itself).
+func (f *field) isLeafPath(fp *fieldPath, pos int32) bool {
+	switch f.model {
+	case fieldModelFixedArray, fieldModelVariableArray:
+		return fp.last == pos
+	case fieldModelFixedTable:
+		return fp.last >= pos && f.serializer.isLeafPath(fp, pos)
+	case fieldModelVariableTable:
+		return fp.last >= pos+1 && f.serializer.isLeafPath(fp, pos+1)
+	}
+	return fp.last == pos-1
 }
