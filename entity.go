@@ -50,11 +50,12 @@ type EntityHandler func(*Entity, EntityOp) error
 
 // Entity represents a single game entity in the replay
 type Entity struct {
-	index  int32
-	serial int32
-	class  *class
-	active bool
-	state  *fieldState
+	index   int32
+	serial  int32
+	class   *class
+	active  bool
+	state   *fieldState
+	changes *entityChanges
 }
 
 // entityAlloc co-allocates an Entity with its root field state, so creating
@@ -62,8 +63,16 @@ type Entity struct {
 // its state rather than embedding it: a slice-holding field would make Entity
 // incomparable, which is part of its public API.
 type entityAlloc struct {
-	entity Entity
-	state  fieldState
+	entity  Entity
+	state   fieldState
+	changes entityChanges
+}
+
+// entityChanges holds the field paths decoded for an entity in the update
+// being dispatched (see ChangedMap). It sits behind a pointer for the same
+// reason as the state: Entity must stay comparable.
+type entityChanges struct {
+	fps []fieldPath
 }
 
 // newEntity returns a new entity for the given index, serial and class, with
@@ -76,6 +85,7 @@ func newEntity(index, serial int32, class *class, baseline *fieldState) *Entity 
 		active: true,
 	}}
 	a.entity.state = &a.state
+	a.entity.changes = &a.changes
 	baseline.cloneTo(&a.state)
 	return &a.entity
 }
@@ -253,6 +263,9 @@ func (p *Parser) FilterEntity(fb func(*Entity) bool) []*Entity {
 type entityOpTuple struct {
 	e  *Entity
 	op EntityOp
+
+	// changed fields of this update: Parser.changedFPs[start:end]
+	start, end int32
 }
 
 // Internal Callback for OnCSVCMsg_PacketEntities.
@@ -283,10 +296,12 @@ func (p *Parser) processPacketEntities(entityData []byte, updatedEntries int32, 
 	}
 
 	tuples := p.entityTuples[:0]
+	changed := p.changedFPs[:0]
 
 	for ; updates > 0; updates-- {
 		index += int32(r.readUBitVar()) + 1
 		op = EntityOpNone
+		start := int32(len(changed))
 
 		cmd = r.readBits(2)
 		if cmd&0x01 == 0 {
@@ -318,6 +333,7 @@ func (p *Parser) processPacketEntities(entityData []byte, updatedEntries int32, 
 				e = newEntity(index, serial, class, baseline)
 				p.entities[index] = e
 				p.fpBuf = readFields(r, class.serializer, e.state, p.fpBuf)
+				changed = append(changed, p.fpBuf...)
 				op = EntityOpCreated | EntityOpEntered
 
 			} else {
@@ -332,6 +348,7 @@ func (p *Parser) processPacketEntities(entityData []byte, updatedEntries int32, 
 				}
 
 				p.fpBuf = readFields(r, e.class.serializer, e.state, p.fpBuf)
+				changed = append(changed, p.fpBuf...)
 			}
 
 		} else {
@@ -350,14 +367,18 @@ func (p *Parser) processPacketEntities(entityData []byte, updatedEntries int32, 
 			}
 		}
 
-		tuples = append(tuples, entityOpTuple{e, op})
+		tuples = append(tuples, entityOpTuple{e, op, start, int32(len(changed))})
 	}
 
 	var err error
 dispatch:
 	for _, h := range p.entityHandlers {
 		for i := range tuples {
-			if err = h(tuples[i].e, tuples[i].op); err != nil {
+			t := &tuples[i]
+			if t.e.changes != nil {
+				t.e.changes.fps = changed[t.start:t.end:t.end]
+			}
+			if err = h(t.e, t.op); err != nil {
 				break dispatch
 			}
 		}
@@ -367,8 +388,14 @@ dispatch:
 	// reused backing array does not retain (possibly deleted) entities and their
 	// state. This runs on every path (success or error), before the single
 	// return.
+	for i := range tuples {
+		if c := tuples[i].e.changes; c != nil {
+			c.fps = nil
+		}
+	}
 	clear(tuples)
 	p.entityTuples = tuples[:0]
+	p.changedFPs = changed[:0]
 	return err
 }
 
@@ -376,4 +403,29 @@ dispatch:
 // is created, updated, deleted, etc.
 func (p *Parser) OnEntity(h EntityHandler) {
 	p.entityHandlers = append(p.entityHandlers, h)
+}
+
+// ChangedMap returns, as key-value pairs, only the fields decoded for this
+// entity in the update currently being dispatched to an EntityHandler: for
+// EntityOpUpdated the fields the server changed, for EntityOpCreated the
+// fields sent on top of the class baseline (use Map for the full state).
+// Values are read from the current state, exactly as Map would return them.
+// Outside an EntityHandler call, and for ops that decode no fields
+// (Left/Deleted), the map is empty.
+func (e *Entity) ChangedMap() map[string]interface{} {
+	if e.changes == nil || len(e.changes.fps) == 0 {
+		return map[string]interface{}{}
+	}
+	values := make(map[string]interface{}, len(e.changes.fps))
+	for i := range e.changes.fps {
+		fp := &e.changes.fps[i]
+		c := e.state.getCell(fp)
+		// List exactly what Map lists: values of simple fields and array
+		// elements, not array lengths or (nested) tables.
+		if c.isEmpty() || c.kind == cellSub || !e.class.serializer.isLeafPath(fp, 0) {
+			continue
+		}
+		values[e.class.getNameForFieldPath(fp)] = c.iface()
+	}
+	return values
 }

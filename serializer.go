@@ -64,3 +64,13 @@ func (s *serializer) getFieldPaths(fp *fieldPath, state *fieldState) []*fieldPat
 func serializerId(name string, version int32) string {
 	return fmt.Sprintf("%s(%d)", name, version)
 }
+
+// isLeafPath reports whether fp, from component pos on, ends at a value that
+// getFieldPaths lists (see field.isLeafPath).
+func (s *serializer) isLeafPath(fp *fieldPath, pos int32) bool {
+	i := fp.path[pos]
+	if i < 0 || int(i) >= len(s.fields) {
+		return false
+	}
+	return s.fields[i].isLeafPath(fp, pos+1)
+}
